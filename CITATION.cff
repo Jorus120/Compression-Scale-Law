@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+title: "Compression Scaling Law (CSL) — Compact Release"
+message: "If you use this in your work, please cite this repository and the explainer PDF."
+authors:
+  - family-names: "CSL Authors"
+    given-names: "Team"
+date-released: "2025-10-23"
+version: "0.1.0"
+preferred-citation:
+  type: report
+  title: "CSL — A Compact Guardrail for Time‑Series Instability"
+  year: 2025
+  authors:
+    - family-names: "CSL Authors"
+      given-names: "Team"
