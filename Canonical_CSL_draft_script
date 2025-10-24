@@ -1,0 +1,116 @@
+import numpy as np
+from scipy.fft import rfft, irfft
+import zlib
+
+def z_score(x):
+    return (x - np.mean(x)) / np.std(x) if np.std(x) > 0 else x
+
+def mu_law_quantize(x, mu=99, bits=8):
+    x = np.clip(x, -1, 1)
+    q = np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
+    return np.round((q + 1) * 2**(bits-1)).astype(np.uint8)
+
+def compress_length(data):
+    return len(zlib.compress(data)) * 8  # bits
+
+def iaaft_surrogate(x, n_iter=100):
+    x_sort = np.sort(x)
+    mag = np.abs(rfft(x))
+    y = np.random.permutation(x.copy())
+    for _ in range(n_iter):
+        phase = np.angle(rfft(y))
+        z = irfft(mag * np.exp(1j * phase), n=len(x))
+        y = x_sort[np.argsort(z)]
+    return y
+
+def compute_delta(x, L, n_surr=10):
+    q_real = mu_law_quantize(x)
+    i_real = compress_length(q_real) / L
+    i_surrs = [compress_length(mu_law_quantize(iaaft_surrogate(x))) / L for _ in range(n_surr)]
+    return i_real - np.mean(i_surrs)
+
+def compute_kappa(x, Ls, step=16, n_surr=10):
+    kappas = []
+    for L in Ls:
+        deltas = []
+        for s in range(0, len(x) - L + 1, step):
+            seg = z_score(x[s:s+L])  # z-score per sub-window
+            delta = compute_delta(seg, L, n_surr)
+            deltas.append(delta)
+        mean_delta = np.mean(deltas)
+        kappa = -L * mean_delta
+        kappas.append(kappa)
+    return np.array(kappas)
+
+def fit_alpha(Ls, kappas, epsilon=1e-6):
+    valid = kappas > epsilon  # avoid log(0) or negative
+    if len(Ls[valid]) < 2:
+        return np.nan
+    logL = np.log(Ls[valid])
+    logK = np.log(kappas[valid])
+    b, a = np.polyfit(logL, logK, 1)
+    return 1 - b
+
+def bootstrap_alpha(x, Ls, step=16, n_surr=10, n_boot=100, block_len=6):
+    alphas = []
+    n_starts = (len(x) - max(Ls) + 1) // step + 1
+    starts = np.arange(0, len(x) - max(Ls) + 1, step)
+    for _ in range(n_boot):
+        boot_starts = []
+        for i in range(0, n_starts, block_len):
+            block = starts[i:i+block_len]
+            boot_block = np.random.choice(block, len(block), replace=True)
+            boot_starts.extend(boot_block)
+        boot_deltas = []
+        for L in Ls:
+            deltas_L = []
+            for s in boot_starts:
+                seg = z_score(x[s:s+L])
+                delta = compute_delta(seg, L, n_surr)
+                deltas_L.append(delta)
+            mean_delta = np.mean(deltas_L)
+            kappa = -L * mean_delta
+            boot_deltas.append(kappa)  # wait, kappas per L
+        kappa_boot = []
+        for L in Ls:
+            deltas_L = [compute_delta(z_score(x[s:s+L]), L, n_surr) for s in boot_starts if s + L <= len(x)]
+            mean_delta = np.mean(deltas_L)
+            kappa = -L * mean_delta
+            kappa_boot.append(kappa)
+        alpha_boot = fit_alpha(Ls, np.array(kappa_boot))
+        if not np.isnan(alpha_boot):
+            alphas.append(alpha_boot)
+    if not alphas:
+        return np.nan, np.nan, np.nan
+    alphas = np.sort(alphas)
+    ci_low = alphas[int(0.025 * len(alphas))]
+    ci_high = alphas[int(0.975 * len(alphas))]
+    return np.mean(alphas), ci_low, ci_high
+
+# Example usage
+if __name__ == "__main__":
+    np.random.seed(42)
+    # i.i.d. null
+    x_iid = np.random.normal(0, 1, 512)
+    Ls = np.array([48, 64, 96, 128, 192])
+    alpha_iid, ci_low, ci_high = bootstrap_alpha(x_iid, Ls)
+    print("i.i.d. alpha:", alpha_iid, "95% CI:", ci_low, ci_high)
+
+    # AR(1) null
+    phi = 0.8
+    x_ar = np.zeros(512)
+    for t in range(1, 512):
+        x_ar[t] = phi * x_ar[t-1] + np.random.normal(0, 1)
+    alpha_ar, ci_low, ci_high = bootstrap_alpha(x_ar, Ls)
+    print("AR(1) alpha:", alpha_ar, "95% CI:", ci_low, ci_high)
+
+    # Structured: sine + noise
+    t = np.arange(512)
+    x_struct = np.sin(2 * np.pi * t / 50) + 0.5 * np.random.normal(0, 1, 512)
+    alpha_struct, ci_low, ci_high = bootstrap_alpha(x_struct, Ls)
+    print("Structured alpha:", alpha_struct, "95% CI:", ci_low, ci_high)
+
+    # For ENSO: Load from file
+    # enso = np.loadtxt('nina34.data', skiprows=1, usecols=range(1,13)) .flatten()
+    # alpha_enso, ci_low, ci_high = bootstrap_alpha(enso, Ls)
+    # print("ENSO alpha:", alpha_enso, "95% CI:", ci_low, ci_high)
