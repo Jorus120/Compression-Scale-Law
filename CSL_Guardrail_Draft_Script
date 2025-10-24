@@ -1,0 +1,144 @@
+import numpy as np
+from scipy import stats
+from scipy.signal import periodogram
+
+def coherence_tilt_alpha(x, window=48, sub_lengths=[6, 12]):
+    alphas = []
+    for i in range(len(x) - window + 1):
+        seg = x[i:i + window]
+        log_kappa = []
+        log_L = []
+        for L in sub_lengths:
+            if window % L != 0:
+                continue
+            n_sub = window // L
+            sub_vars = []
+            for j in range(n_sub):
+                sub_seg = seg[j * L : (j + 1) * L]
+                sub_diff = np.diff(sub_seg)
+                if len(sub_diff) > 1:
+                    sub_vars.append(np.var(sub_diff))
+            if sub_vars:
+                mean_var = np.mean(sub_vars)
+                if mean_var > 0:
+                    log_kappa.append(np.log(mean_var))
+                    log_L.append(np.log(L))
+        if len(log_L) >= 2:
+            b, _ = np.polyfit(log_L, log_kappa, 1)
+            alpha = 1 - b
+        else:
+            alpha = np.nan
+        alphas.append(alpha)
+    return np.array(alphas)
+
+def variance_ratio_alpha(x, window=48, short=6, long=24):
+    alphas = []
+    all_vr = []
+    for i in range(len(x) - window + 1):
+        seg = x[i:i + window]
+        vr = np.var(seg[:short]) / np.var(seg[:long]) if np.var(seg[:long]) > 0 else np.nan
+        all_vr.append(vr)
+    all_vr = np.array(all_vr)
+    valid = ~np.isnan(all_vr)
+    if np.sum(valid) > 0:
+        ranks = stats.rankdata(all_vr[valid]) / len(all_vr[valid])
+        alphas = np.full(len(all_vr), np.nan)
+        alphas[valid] = ranks
+    else:
+        alphas = np.full(len(all_vr), np.nan)
+    return alphas
+
+def compute_csl(alpha, median_window=13, lag=12):
+    if len(alpha) < max(median_window, lag):
+        return np.array([])
+    # Rolling median over median_window
+    medians = np.array([np.nanmedian(alpha[max(0, i-median_window+1):i+1]) for i in range(len(alpha))])
+    L = np.maximum(alpha - medians, 0)
+    S = np.maximum(alpha[lag:] - alpha[:-lag], 0)
+    csl = L[lag:] * S
+    return csl
+
+def online_threshold(csl, p=12/60, warmup=36):
+    thresholds = []
+    alerts = []
+    for t in range(len(csl)):
+        if t < warmup:
+            thresholds.append(np.nan)
+            alerts.append(False)
+            continue
+        past_csl = csl[:t]
+        threshold = np.nanpercentile(past_csl, 100 * (1 - p))
+        thresholds.append(threshold)
+        alerts.append(csl[t] > threshold)
+    return np.array(thresholds), np.array(alerts)
+
+def compute_probes(x, window=48, short=6, long=24, bands=[(6,14), (14,36)]):
+    probes = {
+        'var_short': [],
+        'var_ratio': [],
+        'ac1': [],
+        'ljung_box': [],
+        'spectral_entropy': [],
+        'band_power': []
+    }
+    for i in range(len(x) - window + 1):
+        seg = x[i:i + window]
+        # Var(short)
+        probes['var_short'].append(np.var(seg[:short]))
+        # VarRatio
+        probes['var_ratio'].append(np.var(seg[:short]) / np.var(seg[:long]) if np.var(seg[:long]) > 0 else np.nan)
+        # AC(1)
+        acf = np.correlate(seg - np.mean(seg), seg - np.mean(seg), mode='full')
+        acf = acf[len(seg)-1:] / acf[len(seg)-1]
+        probes['ac1'].append(acf[1] if len(acf) > 1 else np.nan)
+        # Ljung-Box proxy (-log10 p at small lags; approx for lag=1)
+        lb_stat = len(seg) * (acf[1]**2)
+        lb_p = stats.chi2.sf(lb_stat, 1)
+        probes['ljung_box'].append(-np.log10(lb_p) if lb_p > 0 else np.nan)
+        # Spectral entropy
+        f, psd = periodogram(seg)
+        psd_norm = psd / np.sum(psd) if np.sum(psd) > 0 else psd
+        entropy = -np.sum(psd_norm * np.log2(psd_norm + 1e-12)) if np.any(psd_norm > 0) else np.nan
+        probes['spectral_entropy'].append(entropy)
+        # Band power (sum for given bands)
+        band_pow = 0
+        df = f[1] - f[0]
+        for low, high in bands:
+            idx = (f >= 1/high) & (f < 1/low)  # cycle lengths to freq
+            band_pow += np.sum(psd[idx]) * df
+        probes['band_power'].append(band_pow / np.sum(psd) if np.sum(psd) > 0 else np.nan)
+    return {k: np.array(v) for k, v in probes.items()}
+
+# Example usage
+if __name__ == "__main__":
+    np.random.seed(42)
+    # Synthetic data: AR(1) with regime shift
+    t = np.arange(200)
+    x = np.zeros(200)
+    for i in range(1, 100):
+        x[i] = 0.5 * x[i-1] + np.random.normal()
+    for i in range(100, 200):
+        x[i] = 0.9 * x[i-1] + np.random.normal(scale=2)  # higher persistence, variance
+
+    # Compute alpha (coherence-tilt)
+    alpha_ct = coherence_tilt_alpha(x)
+    print("Coherence-tilt alpha:", alpha_ct[:5])  # first few
+
+    # Variance-ratio alpha
+    alpha_vr = variance_ratio_alpha(x)
+    print("Variance-ratio alpha:", alpha_vr[:5])
+
+    # CSL score (using variance-ratio)
+    csl = compute_csl(alpha_vr)
+    print("CSL scores:", csl[:5])
+
+    # Threshold and alerts
+    thresholds, alerts = online_threshold(csl)
+    print("Alerts:", alerts)
+
+    # Probes at alert windows (example for full series)
+    probes = compute_probes(x)
+    for k, v in probes.items():
+        print(f"{k}: {v[:5]}")
+
+    # For real data like ENSO: load CSV, flatten monthly, run above
